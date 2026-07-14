@@ -1,5 +1,6 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
 import unicodedata
 
@@ -37,22 +38,22 @@ header[data-testid="stHeader"] {
 }
 
 [data-testid="stMainBlockContainer"] {
-    padding-top: 0.5rem !important; 
+    padding-top: 0.5rem !important;
     margin-top: 0rem !important;
 }
 
 /* --- JERARQUÍA DE TÍTULOS --- */
 h1 {
-    font-size: 26px !important; 
+    font-size: 26px !important;
     margin-top: 0px !important;
-    margin-bottom: 8px !important; 
+    margin-bottom: 8px !important;
     padding-top: 0px !important;
     color: #1E293B;
     line-height: 1.2 !important;
 }
 
 h3, .section-subtitle {
-    font-size: 18px !important; 
+    font-size: 18px !important;
     margin-top: 5px !important;
     margin-bottom: 8px !important;
     padding-bottom: 0px !important;
@@ -81,6 +82,17 @@ h3, .section-subtitle {
     font-weight: 600;
     margin-bottom: 10px;
     border: 1px solid #AABFFF;
+}
+
+.alerta-valvula {
+    background-color: #FFF6E5;
+    color: #B36B00;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    border: 1px solid #FFD98A;
 }
 
 /* Sustituto compacto para st.divider() */
@@ -132,14 +144,14 @@ div.stButton > button {
     flex-direction: column;
     justify-content: center;
 }
-.kpi-title { 
-    font-size: 13px; 
-    font-weight: 700 !important; 
+.kpi-title {
+    font-size: 13px;
+    font-weight: 700 !important;
     margin-bottom: 3px;
 }
-.kpi-value { 
-    font-size: 17px; 
-    font-weight: 400 !important; 
+.kpi-value {
+    font-size: 17px;
+    font-weight: 400 !important;
 }
 
 /* Estilo específico para Periodo (C6) */
@@ -150,6 +162,20 @@ div.stButton > button {
 """,
 unsafe_allow_html=True
 )
+
+# =====================================================
+# PARÁMETROS DE CLASIFICACIÓN (ajustables)
+# =====================================================
+
+UMBRAL_P1 = 0.15          # bar. Por debajo de esto se considera "P1 en cero" (sector cerrado / sin presión)
+FRAC_DIAS_TANDEO = 0.6     # fracción mínima de días del periodo que deben mostrar el evento para considerarlo recurrente
+TOL_HORA_TANDEO = 2.0      # horas. Tolerancia de dispersión en la hora de inicio del evento para considerarlo "misma hora todos los días"
+CV_DURACION_TANDEO = 0.5   # coeficiente de variación máximo de la duración de los eventos para considerarlos "misma duración"
+MIN_DIAS_ANALISIS = 2      # con menos días no se puede evaluar recurrencia/periodicidad de forma confiable
+VENTANA_PICO_MIN = 60      # minutos tras el cierre en que se busca el pico de apertura (tandeo)
+
+UMBRAL_Q_CIERRE = 0.05     # lps. Caudal prácticamente exacto en 0 (más estricto que el umbral de tandeo/falla)
+MIN_DURACION_CIERRE_MIN = 30  # minutos. Duración mínima para no confundir un cierre real con ruido de una sola lectura
 
 # =====================================================
 # FUNCIONES DE APOYO
@@ -167,6 +193,101 @@ def clasificar_variable(var):
     if "p2" in v or "presion 2" in v: return "P2"
     if "q" in v or "caudal" in v: return "Q"
     return None
+
+def construir_eventos_cero(serie_df, umbral):
+    """Agrupa lecturas consecutivas por debajo del umbral en 'eventos' (inicio, fin, duración)."""
+    if serie_df.empty:
+        return pd.DataFrame(columns=["inicio", "fin", "duracion_h", "fecha", "hora_inicio"])
+
+    d = serie_df.sort_values("FechaHora").copy()
+    d["EsCero"] = d["Valor"] < umbral
+    d["grupo"] = (d["EsCero"] != d["EsCero"].shift()).cumsum()
+
+    eventos = d[d["EsCero"]].groupby("grupo").agg(inicio=("FechaHora", "min"), fin=("FechaHora", "max")).reset_index(drop=True)
+    if eventos.empty:
+        return eventos
+
+    intervalo = d["FechaHora"].diff().dt.total_seconds().median()
+    intervalo = intervalo if pd.notna(intervalo) and intervalo > 0 else 0
+
+    eventos["duracion_h"] = (eventos["fin"] - eventos["inicio"]).dt.total_seconds() / 3600 + intervalo / 3600
+    eventos["fecha"] = eventos["inicio"].dt.date
+    eventos["hora_inicio"] = eventos["inicio"].dt.hour + eventos["inicio"].dt.minute / 60
+    return eventos
+
+def _desviacion_horaria_circular(horas):
+    """Desviación estándar 'circular' de horas del día (0-24h), para que 23:50 y 00:10 se traten como cercanas."""
+    angulos = horas.to_numpy() / 24 * 2 * np.pi
+    sin_m, cos_m = np.mean(np.sin(angulos)), np.mean(np.cos(angulos))
+    r = min(np.sqrt(sin_m**2 + cos_m**2), 0.9999)
+    if r <= 0:
+        return np.inf
+    return np.sqrt(-2 * np.log(r)) / (2 * np.pi) * 24
+
+def clasificar_patron(eventos, dias_totales):
+    """
+    Devuelve: "sin_eventos", "tandeo" o "falla_operacional".
+
+    Tandeo    -> P1 cae a 0 de forma recurrente y a horas similares todos los días (patrón/periodicidad).
+    Falla op. -> P1 cae a 0 de forma esporádica, sin patrón horario y con duraciones dispares.
+    """
+    if eventos.empty:
+        return "sin_eventos"
+    if dias_totales < MIN_DIAS_ANALISIS or len(eventos) < 2:
+        return "falla_operacional"
+
+    frac_dias = eventos["fecha"].nunique() / dias_totales
+    dispersion_hora = _desviacion_horaria_circular(eventos["hora_inicio"])
+    dur_media = eventos["duracion_h"].mean()
+    cv_duracion = eventos["duracion_h"].std(ddof=0) / dur_media if dur_media > 0 else np.inf
+
+    es_recurrente = frac_dias >= FRAC_DIAS_TANDEO
+    es_misma_hora = dispersion_hora <= TOL_HORA_TANDEO
+    es_misma_duracion = cv_duracion <= CV_DURACION_TANDEO
+
+    if es_recurrente and es_misma_hora and es_misma_duracion:
+        return "tandeo"
+    return "falla_operacional"
+
+def marcar_cerrado(df, eventos, margen_min=0):
+    """Marca True en las filas de df cuyo FechaHora cae dentro de alguna ventana de evento (P1≈0)."""
+    cerrado = pd.Series(False, index=df.index)
+    if df.empty or eventos.empty:
+        return cerrado
+    margen = pd.Timedelta(minutes=margen_min)
+    for _, ev in eventos.iterrows():
+        cerrado |= (df["FechaHora"] >= ev["inicio"] - margen) & (df["FechaHora"] <= ev["fin"] + margen)
+    return cerrado
+
+def construir_eventos_cierre_valvula(q_df, p1_df, umbral_q=UMBRAL_Q_CIERRE, umbral_p1=UMBRAL_P1, min_dur_min=MIN_DURACION_CIERRE_MIN):
+    """
+    Detecta cierres de válvula por condición de trabajo fuera de rango: tramos donde Q cae
+    prácticamente a 0 de forma sostenida MIENTRAS P1 se mantiene normal (no es un corte de
+    suministro, es la válvula cerrando con presión presente aguas arriba).
+    """
+    eventos_q = construir_eventos_cero(q_df, umbral_q)
+    if eventos_q.empty or p1_df.empty:
+        return eventos_q.iloc[0:0]
+
+    validos = []
+    for _, ev in eventos_q.iterrows():
+        if ev["duracion_h"] * 60 < min_dur_min:
+            continue
+        p1_ventana = p1_df[(p1_df["FechaHora"] >= ev["inicio"]) & (p1_df["FechaHora"] <= ev["fin"])]
+        if p1_ventana.empty or p1_ventana["Valor"].min() >= umbral_p1:
+            validos.append(ev)
+    return pd.DataFrame(validos) if validos else eventos_q.iloc[0:0]
+
+def calcular_pico_apertura(q_df, eventos, ventana_min=VENTANA_PICO_MIN):
+    """Para tandeo: promedio del caudal pico registrado justo al reabrir cada ciclo."""
+    if q_df.empty or eventos.empty:
+        return None
+    picos = []
+    for _, ev in eventos.iterrows():
+        ventana = q_df[(q_df["FechaHora"] > ev["fin"]) & (q_df["FechaHora"] <= ev["fin"] + pd.Timedelta(minutes=ventana_min))]
+        if not ventana.empty:
+            picos.append(ventana["Valor"].max())
+    return float(np.mean(picos)) if picos else None
 
 # =====================================================
 # SIDEBAR
@@ -203,69 +324,55 @@ if archivo is not None and ejecutar_calculo:
     df_raw["FechaHora"] = pd.to_datetime(df_raw["FechaHora"], dayfirst=True)
     df_raw["Valor"] = df_raw["Valor"].astype(str).str.replace(",", ".", regex=False).astype(float)
     df_raw["Tipo"] = df_raw["Variable"].apply(clasificar_variable)
-    
+
     # Extraer dataframes independientes por variable
     p1 = df_raw[df_raw["Tipo"] == "P1"].sort_values("FechaHora").copy()
     p2 = df_raw[df_raw["Tipo"] == "P2"].sort_values("FechaHora").copy()
     q = df_raw[df_raw["Tipo"] == "Q"].sort_values("FechaHora").copy()
 
-    # 2. Análisis y Diagnóstico Dinámico del Tipo de Suministro
-    es_tandeo = False
-    hay_interrupcion = False
-    fechas_falla_p1 = set()
+    # 2. Detección de eventos de P1≈0 y clasificación de patrón (tandeo vs falla operacional)
+    dias_totales = df_raw["FechaHora"].dt.date.nunique()
+    eventos_p1 = construir_eventos_cero(p1, UMBRAL_P1)
+    patron = clasificar_patron(eventos_p1, dias_totales)
 
-    if not q.empty:
-        # Tandeo detectado si pasa cerrado o en cero relativo (< 0.15 lps) más del 35% del tiempo total
-        es_tandeo = (q["Valor"] <= 0.15).mean() > 0.35
+    es_tandeo = patron == "tandeo"
+    hay_falla_operacional = patron == "falla_operacional"
 
-    if not es_tandeo and not p1.empty:
-        p1["SoloFecha"] = p1["FechaHora"].dt.strftime('%Y-%m-%d')
-        p1["EsBaja"] = p1["Valor"] < 0.15
-        resumen_diario_p1 = p1.groupby("SoloFecha")["EsBaja"].mean()
-        fechas_falla_p1 = set(resumen_diario_p1[resumen_diario_p1 > 0.15].index)
-        hay_interrupcion = len(fechas_falla_p1) > 0
+    # Cierres de válvula por condición de trabajo fuera de rango: Q≈0 sostenido con P1 normal.
+    # Distinto de tandeo/falla (esos son P1≈0). Solo afecta a Q, no a P1/P2 (esas presiones siguen siendo válidas).
+    eventos_valvula = construir_eventos_cierre_valvula(q, p1)
+    hay_cierre_valvula = not eventos_valvula.empty
 
-    # 3. Cálculos Generales de Indicadores (KPIs)
-    p1_prom = p1["Valor"].mean() if not p1.empty else 0.0
-    p2_prom = p2["Valor"].mean() if not p2.empty else 0.0
-    
-    if es_tandeo:
-        q_prom = q["Valor"].mean() if not q.empty else 0.0
-    else:
-        # Suministro continuo clásico: Remueve periodos de fallas externas ajenas para el cálculo real
-        q_valido_prom = q.copy()
-        if hay_interrupcion:
-            q_valido_prom = q_valido_prom[~q_valido_prom["FechaHora"].dt.strftime('%Y-%m-%d').isin(fechas_falla_p1)]
-        q_prom = q_valido_prom[q_valido_prom["Valor"] > 0.1]["Valor"].mean() if not q_valido_prom.empty else 0.0
+    # Ventanas de "cerrado" proyectadas sobre cada serie, para excluirlas del cálculo de indicadores
+    p1["Cerrado"] = marcar_cerrado(p1, eventos_p1) if not p1.empty else False
+    p2["Cerrado"] = marcar_cerrado(p2, eventos_p1) if not p2.empty else False
+    q["Cerrado"] = (marcar_cerrado(q, eventos_p1) | marcar_cerrado(q, eventos_valvula)) if not q.empty else False
 
-    # Cálculo preciso del Volumen Integrado
+    p1_abierto = p1[~p1["Cerrado"]] if not p1.empty else p1
+    p2_abierto = p2[~p2["Cerrado"]] if not p2.empty else p2
+    q_abierto = q[~q["Cerrado"]] if not q.empty else q
+
+    # 3. Cálculos Generales de Indicadores (KPIs) — excluyendo tramos "cerrados" en ambos escenarios
+    p1_prom = p1_abierto["Valor"].mean() if not p1_abierto.empty else 0.0
+    p2_prom = p2_abierto["Valor"].mean() if not p2_abierto.empty else 0.0
+    q_prom = q_abierto[q_abierto["Valor"] > 0.1]["Valor"].mean() if not q_abierto.empty else 0.0
+
+    q_pico_apertura = calcular_pico_apertura(q, eventos_p1) if es_tandeo else None
+
+    # Volumen: se integra sobre la serie completa (es un totalizador del periodo, no un promedio representativo)
     if not q.empty:
         q["Delta_t"] = q["FechaHora"].diff().dt.total_seconds().fillna(0)
         volumen = (q["Valor"] * q["Delta_t"] / 1000).sum()
-        f_min = q['FechaHora'].min().strftime('%d/%m/%Y')
-        f_max = q['FechaHora'].max().strftime('%d/%m/%Y')
+        f_min = q["FechaHora"].min().strftime('%d/%m/%Y')
+        f_max = q["FechaHora"].max().strftime('%d/%m/%Y')
     else:
         volumen = 0.0
         f_min = f_max = "-/-/-"
 
-    # 4. Cálculo de MNF de Horario Estándar Nocturno
+    # 4. MNF (mínimo entre 2:00 y 4:00 AM), sobre los tramos "abiertos" únicamente
     nmf = None
-    q_pico_apertura = None
-    
-    if not q.empty:
-        q_mnf = q.copy()
-        
-        if es_tandeo:
-            q_pico_apertura = q_mnf["Valor"].max()
-            
-        # Para resguardar la lógica e indicadores matemáticos, el MNF siempre medirá el mínimo absoluto 
-        # registrado estrictamente en el horario nocturno de menor actividad (2:00 AM a 4:00 AM)
-        q_mnf["SoloFecha"] = q_mnf["FechaHora"].dt.strftime('%Y-%m-%d')
-        if not es_tandeo and hay_interrupcion:
-            q_mnf = q_mnf[~q_mnf["SoloFecha"].isin(fechas_falla_p1)]
-            
-        q_noche = q_mnf[(q_mnf["FechaHora"].dt.hour >= 2) & (q_mnf["FechaHora"].dt.hour < 4)].copy()
-        
+    if not q_abierto.empty:
+        q_noche = q_abierto[(q_abierto["FechaHora"].dt.hour >= 2) & (q_abierto["FechaHora"].dt.hour < 4)]
         if not q_noche.empty:
             nmf = q_noche["Valor"].min()
 
@@ -273,14 +380,31 @@ if archivo is not None and ejecutar_calculo:
     # INDICADORES DEL SECTOR
     # =====================================================
     st.markdown("### Indicadores del Sector")
-    
+
     if es_tandeo:
-        st.markdown('<div class="alerta-tandeo">🔄 Suministro Intermitente (Tandeo Detectado)</div>', unsafe_allow_html=True)
-    elif hay_interrupcion:
-        st.markdown('<div class="alerta-suministro">⚠️ Detección de interrupción en el suministro</div>', unsafe_allow_html=True)
-    
+        frac_dias = eventos_p1["fecha"].nunique() / dias_totales
+        hora_prom = eventos_p1["hora_inicio"].mean()
+        st.markdown(
+            f'<div class="alerta-tandeo">🔄 Suministro Intermitente (Tandeo detectado — patrón recurrente en '
+            f'{frac_dias*100:.0f}% de los días, cierre habitual ~{hora_prom:.0f}:00 h)</div>',
+            unsafe_allow_html=True
+        )
+    elif hay_falla_operacional:
+        st.markdown(
+            f'<div class="alerta-suministro">⚠️ Fallas operacionales esporádicas detectadas '
+            f'({len(eventos_p1)} evento(s) sin patrón definido) — excluidas del cálculo de indicadores</div>',
+            unsafe_allow_html=True
+        )
+
+    if hay_cierre_valvula:
+        st.markdown(
+            f'<div class="alerta-valvula">🔧 Cierre(s) de válvula por condición de trabajo fuera de rango '
+            f'({len(eventos_valvula)} evento(s), Q≈0 con P1 normal) — excluidos del cálculo de Q prom y MNF</div>',
+            unsafe_allow_html=True
+        )
+
     c1, c2, c3, c4, c5, c6 = st.columns(6)
-    
+
     def kpi(col, t, v):
         col.markdown(f'<div class="kpi-box"><div class="kpi-title">{t}</div><div class="kpi-value">{v}</div></div>', unsafe_allow_html=True)
 
@@ -288,15 +412,15 @@ if archivo is not None and ejecutar_calculo:
     kpi(c2, "P2 (bar)", f"{p2_prom:.2f}")
     kpi(c3, "Q prom (lps)", f"{q_prom:.2f}")
     kpi(c4, "Volumen", f"{volumen:.2f} m³")
-    
+
     # Cambiamos dinámicamente el título del KPI si hay tandeo para alertar sobre el pico
     if es_tandeo and q_pico_apertura is not None:
         kpi(c5, "Q Pico Apertura (lps)", f"{q_pico_apertura:.2f}")
     else:
         kpi(c5, "MNF (lps)", f"{nmf:.2f}" if nmf is not None else "-")
-    
+
     c6.markdown(
-        f'<div class="kpi-periodo"><div class="kpi-title">Periodo</div><div class="kpi-value">{f_min}<br>–<br>{f_max}</div></div>', 
+        f'<div class="kpi-periodo"><div class="kpi-title">Periodo</div><div class="kpi-value">{f_min}<br>–<br>{f_max}</div></div>',
         unsafe_allow_html=True
     )
 
@@ -309,12 +433,11 @@ if archivo is not None and ejecutar_calculo:
 
     with col_tabla:
         st.markdown('<h3 class="section-subtitle">Resumen</h3>', unsafe_allow_html=True)
-        
-        # En la tabla de resumen incluimos AMBOS valores si es tandeo para un análisis completo
+
         indicadores_lista = ["P1", "P2", "Q prom", "Volumen", "MNF"]
         valores_lista = [f"{p1_prom:.2f}", f"{p2_prom:.2f}", f"{q_prom:.2f}", f"{volumen:.2f}", f"{nmf:.2f}" if nmf is not None else "-"]
         unidades_lista = ["bar", "bar", "lps", "m³", "lps"]
-        
+
         if es_tandeo and q_pico_apertura is not None:
             indicadores_lista.append("Q Pico Apertura")
             valores_lista.append(f"{q_pico_apertura:.2f}")
@@ -329,22 +452,43 @@ if archivo is not None and ejecutar_calculo:
 
     with col_grafico:
         fig = go.Figure()
-        
+
         if not q.empty:
             fig.add_trace(go.Scatter(x=q["FechaHora"], y=q["Valor"], mode="lines", name="Q", line=dict(width=2, color="blue")))
             fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[q_prom, q_prom], mode="lines", name="Q prom", line=dict(width=1.5, color="red", dash="dot")))
-            
+
             if nmf is not None:
                 fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[nmf, nmf], mode="lines", name="MNF", line=dict(width=2, color="green", dash="dash")))
-            
-            # Dibujar línea indicadora del pico crítico de apertura si hay tandeo
+
             if es_tandeo and q_pico_apertura is not None:
                 fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[q_pico_apertura, q_pico_apertura], mode="lines", name="Pico de Apertura", line=dict(width=1.5, color="purple", dash="longdashdot")))
 
+            # Sombreado de los tramos "cerrados" (P1≈0) excluidos del cálculo, para validar visualmente la clasificación
+            if not eventos_p1.empty:
+                color_evento = "rgba(0,68,204,0.15)" if es_tandeo else "rgba(204,0,0,0.15)"
+                nombre_evento = "Tandeo (cerrado)" if es_tandeo else "Falla operacional"
+                for i, (_, ev) in enumerate(eventos_p1.iterrows()):
+                    fig.add_vrect(
+                        x0=ev["inicio"], x1=ev["fin"],
+                        fillcolor=color_evento, opacity=0.5, line_width=0,
+                        annotation_text=nombre_evento if i == 0 else None,
+                        annotation_position="top left"
+                    )
+
+            # Sombreado de cierres de válvula (Q≈0 con P1 normal) excluidos de Q prom / MNF
+            if not eventos_valvula.empty:
+                for i, (_, ev) in enumerate(eventos_valvula.iterrows()):
+                    fig.add_vrect(
+                        x0=ev["inicio"], x1=ev["fin"],
+                        fillcolor="rgba(255,153,0,0.20)", opacity=0.6, line_width=0,
+                        annotation_text="Cierre de válvula" if i == 0 else None,
+                        annotation_position="bottom left"
+                    )
+
         fig.update_layout(
-            height=460, 
+            height=460,
             margin=dict(t=10, b=10, l=10, r=10),
-            hovermode="x unified", 
+            hovermode="x unified",
             xaxis=dict(rangeslider=dict(visible=True), type="date"),
             legend=dict(orientation="h", y=1.15, x=0.5, xanchor="center")
         )
