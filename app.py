@@ -95,6 +95,17 @@ h3, .section-subtitle {
     border: 1px solid #FFD98A;
 }
 
+.alerta-info {
+    background-color: #F1F5F9;
+    color: #475569;
+    padding: 8px 12px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 600;
+    margin-bottom: 10px;
+    border: 1px solid #CBD5E1;
+}
+
 /* Sustituto compacto para st.divider() */
 .compact-divider {
     border-top: 1px solid #e6e6e6;
@@ -177,6 +188,9 @@ VENTANA_PICO_MIN = 60      # minutos tras el cierre en que se busca el pico de a
 UMBRAL_Q_CIERRE = 0.05     # lps. Caudal prácticamente exacto en 0 (más estricto que el umbral de tandeo/falla)
 MIN_DURACION_CIERRE_MIN = 30  # minutos. Duración mínima para no confundir un cierre real con ruido de una sola lectura
 
+PSI_A_BAR = 0.0689476      # factor de conversión 1 psi = 0.0689476 bar
+UMBRAL_PSI_DETECCION = 25  # bar. Si el promedio de una serie de presión supera esto, se asume que viene en psi y se convierte
+
 # =====================================================
 # FUNCIONES DE APOYO
 # =====================================================
@@ -189,10 +203,23 @@ def normalizar(texto):
 
 def clasificar_variable(var):
     v = normalizar(var)
-    if "p1" in v or "presion 1" in v: return "P1"
-    if "p2" in v or "presion 2" in v: return "P2"
+    if "p1" in v or "presion 1" in v or "aguas arriba" in v: return "P1"
+    if "p2" in v or "presion 2" in v or "aguas abajo" in v: return "P2"
     if "q" in v or "caudal" in v: return "Q"
     return None
+
+def convertir_si_es_psi(serie_df, umbral_bar=UMBRAL_PSI_DETECCION):
+    """
+    Si el promedio de la serie de presión supera el umbral (poco realista en bar para un DMA),
+    se asume que los datos vienen en psi y se convierten a bar. Devuelve (serie_convertida, fue_psi).
+    """
+    if serie_df.empty:
+        return serie_df, False
+    if serie_df["Valor"].mean() > umbral_bar:
+        serie_df = serie_df.copy()
+        serie_df["Valor"] = serie_df["Valor"] * PSI_A_BAR
+        return serie_df, True
+    return serie_df, False
 
 def construir_eventos_cero(serie_df, umbral):
     """Agrupa lecturas consecutivas por debajo del umbral en 'eventos' (inicio, fin, duración)."""
@@ -330,6 +357,11 @@ if archivo is not None and ejecutar_calculo:
     p2 = df_raw[df_raw["Tipo"] == "P2"].sort_values("FechaHora").copy()
     q = df_raw[df_raw["Tipo"] == "Q"].sort_values("FechaHora").copy()
 
+    # Detección y conversión automática de psi a bar (algunos ConDor reportan presión en psi)
+    p1, p1_fue_psi = convertir_si_es_psi(p1)
+    p2, p2_fue_psi = convertir_si_es_psi(p2)
+    hay_conversion_psi = p1_fue_psi or p2_fue_psi
+
     # 2. Detección de eventos de P1≈0 y clasificación de patrón (tandeo vs falla operacional)
     dias_totales = df_raw["FechaHora"].dt.date.nunique()
     eventos_p1 = construir_eventos_cero(p1, UMBRAL_P1)
@@ -400,6 +432,13 @@ if archivo is not None and ejecutar_calculo:
         st.markdown(
             f'<div class="alerta-valvula">🔧 Cierre(s) de válvula por condición de trabajo fuera de rango '
             f'({len(eventos_valvula)} evento(s), Q≈0 con P1 normal) — excluidos del cálculo de Q prom y MNF</div>',
+            unsafe_allow_html=True
+        )
+
+    if hay_conversion_psi:
+        sensores_psi = " y ".join([n for n, f in [("P1", p1_fue_psi), ("P2", p2_fue_psi)] if f])
+        st.markdown(
+            f'<div class="alerta-info">🔁 Presión de {sensores_psi} detectada en psi — convertida automáticamente a bar</div>',
             unsafe_allow_html=True
         )
 
