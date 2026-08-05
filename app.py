@@ -169,6 +169,12 @@ div.stButton > button {
 .kpi-periodo .kpi-title { font-size: 11px; font-weight: 700 !important; }
 .kpi-periodo .kpi-value { font-size: 12px; font-weight: 400 !important; line-height: 1.2; }
 
+/* KPI destacado de ahorro proyectado */
+.kpi-ahorro {
+    background-color: #EAF7EE !important;
+    border: 1px solid #8FD9A8 !important;
+}
+
 </style>
 """,
 unsafe_allow_html=True
@@ -190,6 +196,8 @@ MIN_DURACION_CIERRE_MIN = 30  # minutos. Duración mínima para no confundir un 
 
 PSI_A_BAR = 0.0689476      # factor de conversión 1 psi = 0.0689476 bar
 UMBRAL_PSI_DETECCION = 25  # bar. Si el promedio de una serie de presión supera esto, se asume que viene en psi y se convierte
+
+FACTOR_ANUAL_LPS_A_M3 = 3600 * 24 * 365 / 1000  # convierte una diferencia de caudal sostenida (lps) a m³/año
 
 # =====================================================
 # FUNCIONES DE APOYO
@@ -316,35 +324,50 @@ def calcular_pico_apertura(q_df, eventos, ventana_min=VENTANA_PICO_MIN):
             picos.append(ventana["Valor"].max())
     return float(np.mean(picos)) if picos else None
 
-# =====================================================
-# SIDEBAR
-# =====================================================
+def calcular_mnf(q_abierto):
+    """
+    MNF = media aritmética del caudal mínimo de cada 'valle nocturno'.
 
-with st.sidebar:
-    st.image("logo.png", width=160)
-    st.markdown("""
-    Calcula automáticamente desde la hoja de excel de cualquier ConDor de SkyPlatform:
-    - **Presión aguas arriba** (bar o psi)
-    - **Presión aguas abajo** (bar o psi)
-    - **Caudal promedio** (lps)
-    - **Volumen total** ($m^3$)
-    - **MNF** (Minimum Night Flow)
-    """)
-    st.write("---")
-    archivo = st.file_uploader("Cargar archivo Excel", type=["xlsx"])
-    ejecutar_calculo = st.button("▶ Ejecutar cálculo")
+    En vez de una ventana fija (p.ej. 2-4am) o el mínimo del día completo, se detecta el valle de
+    forma dinámica en cada ciclo noche-mañana (de mediodía a mediodía, para no partir el valle a la
+    mitad en la madrugada): se ubica el punto más bajo del ciclo y se expande hacia atrás y hacia
+    adelante mientras el caudal se mantenga por debajo del nivel promedio del ciclo — eso delimita
+    el tramo real desde que empieza a bajar en la noche hasta que empieza a subir en la madrugada.
+    El mínimo se toma solo dentro de ese tramo.
+    """
+    if q_abierto.empty:
+        return None
 
-# =====================================================
-# INTERFAZ PRINCIPAL
-# =====================================================
+    df = q_abierto.sort_values("FechaHora").copy()
+    df["CicloNoche"] = (df["FechaHora"] - pd.Timedelta(hours=12)).dt.date
 
-st.title("Dashboard de Indicadores en un DMA")
+    minimos_valle = []
+    for _, grupo in df.groupby("CicloNoche"):
+        if len(grupo) < 3:
+            continue
+        grupo = grupo.sort_values("FechaHora").reset_index(drop=True)
 
-if archivo is None:
-    st.info("Carga un archivo desde el panel izquierdo y presiona 'Ejecutar cálculo'.")
+        suavizado = grupo["Valor"].rolling(3, center=True, min_periods=1).mean()
+        idx_min = suavizado.idxmin()
+        umbral_valle = suavizado.mean()
 
-if archivo is not None and ejecutar_calculo:
-    # 1. Procesamiento e independización de Series
+        ini = idx_min
+        while ini > 0 and suavizado[ini - 1] <= umbral_valle:
+            ini -= 1
+        fin = idx_min
+        while fin < len(suavizado) - 1 and suavizado[fin + 1] <= umbral_valle:
+            fin += 1
+
+        valle = grupo.loc[ini:fin, "Valor"]
+        if not valle.empty:
+            minimos_valle.append(valle.min())
+
+    if not minimos_valle:
+        return None
+    return float(np.mean(minimos_valle))
+
+def procesar_archivo(archivo):
+    """Lee un Excel de ConDor y devuelve un dict con todos los indicadores/insumos para renderizar el dashboard."""
     df_raw = pd.read_excel(archivo)
     df_raw.columns = df_raw.columns.str.strip()
     df_raw = df_raw.rename(columns={"Data Logger": "Variable", "Fecha y hora": "FechaHora", "Media": "Valor"})
@@ -362,7 +385,7 @@ if archivo is not None and ejecutar_calculo:
     p2, p2_fue_psi = convertir_si_es_psi(p2)
     hay_conversion_psi = p1_fue_psi or p2_fue_psi
 
-    # 2. Detección de eventos de P1≈0 y clasificación de patrón (tandeo vs falla operacional)
+    # Detección de eventos de P1≈0 y clasificación de patrón (tandeo vs falla operacional)
     dias_totales = df_raw["FechaHora"].dt.date.nunique()
     eventos_p1 = construir_eventos_cero(p1, UMBRAL_P1)
     patron = clasificar_patron(eventos_p1, dias_totales)
@@ -384,7 +407,7 @@ if archivo is not None and ejecutar_calculo:
     p2_abierto = p2[~p2["Cerrado"]] if not p2.empty else p2
     q_abierto = q[~q["Cerrado"]] if not q.empty else q
 
-    # 3. Cálculos Generales de Indicadores (KPIs) — excluyendo tramos "cerrados" en ambos escenarios
+    # Cálculos Generales de Indicadores (KPIs) — excluyendo tramos "cerrados" en todos los escenarios
     p1_prom = p1_abierto["Valor"].mean() if not p1_abierto.empty else 0.0
     p2_prom = p2_abierto["Valor"].mean() if not p2_abierto.empty else 0.0
     q_prom = q_abierto[q_abierto["Valor"] > 0.1]["Valor"].mean() if not q_abierto.empty else 0.0
@@ -401,42 +424,51 @@ if archivo is not None and ejecutar_calculo:
         volumen = 0.0
         f_min = f_max = "-/-/-"
 
-    # 4. MNF (mínimo entre 2:00 y 4:00 AM), sobre los tramos "abiertos" únicamente
-    nmf = None
-    if not q_abierto.empty:
-        q_noche = q_abierto[(q_abierto["FechaHora"].dt.hour >= 2) & (q_abierto["FechaHora"].dt.hour < 4)]
-        if not q_noche.empty:
-            nmf = q_noche["Valor"].min()
+    # MNF: media aritmética del caudal mínimo de cada período de 24 horas, sobre los tramos "abiertos"
+    nmf = calcular_mnf(q_abierto)
 
-    # =====================================================
-    # INDICADORES DEL SECTOR
-    # =====================================================
+    return {
+        "p1_prom": p1_prom, "p2_prom": p2_prom, "q_prom": q_prom, "volumen": volumen,
+        "nmf": nmf, "f_min": f_min, "f_max": f_max,
+        "es_tandeo": es_tandeo, "hay_falla_operacional": hay_falla_operacional,
+        "hay_cierre_valvula": hay_cierre_valvula, "hay_conversion_psi": hay_conversion_psi,
+        "p1_fue_psi": p1_fue_psi, "p2_fue_psi": p2_fue_psi,
+        "eventos_p1": eventos_p1, "eventos_valvula": eventos_valvula,
+        "dias_totales": dias_totales, "q_pico_apertura": q_pico_apertura,
+        "q": q,
+    }
+
+def kpi(col, t, v, clase_extra=""):
+    col.markdown(f'<div class="kpi-box {clase_extra}"><div class="kpi-title">{t}</div><div class="kpi-value">{v}</div></div>', unsafe_allow_html=True)
+
+def mostrar_dashboard(r, key_prefix=""):
+    """Renderiza alertas + KPIs + tabla resumen + gráfico para un resultado de procesar_archivo()."""
     st.markdown("### Indicadores del Sector")
 
-    if es_tandeo:
-        frac_dias = eventos_p1["fecha"].nunique() / dias_totales
-        hora_prom = eventos_p1["hora_inicio"].mean()
+    if r["es_tandeo"]:
+        frac_dias = r["eventos_p1"]["fecha"].nunique() / r["dias_totales"]
+        hora_prom = r["eventos_p1"]["hora_inicio"].mean()
         st.markdown(
             f'<div class="alerta-tandeo">🔄 Suministro Intermitente (Tandeo detectado — patrón recurrente en '
             f'{frac_dias*100:.0f}% de los días, cierre habitual ~{hora_prom:.0f}:00 h)</div>',
             unsafe_allow_html=True
         )
-    elif hay_falla_operacional:
+    elif r["hay_falla_operacional"]:
         st.markdown(
             f'<div class="alerta-suministro">⚠️ Fallas operacionales esporádicas detectadas '
-            f'({len(eventos_p1)} evento(s) sin patrón definido) — excluidas del cálculo de indicadores</div>',
+            f'({len(r["eventos_p1"])} evento(s) sin patrón definido) — excluidas del cálculo de indicadores</div>',
             unsafe_allow_html=True
         )
 
-    if hay_cierre_valvula:
+    if r["hay_cierre_valvula"]:
         st.markdown(
             f'<div class="alerta-valvula">🔧 Cierre(s) de válvula por condición de trabajo fuera de rango '
-            f'({len(eventos_valvula)} evento(s), Q≈0 con P1 normal) — excluidos del cálculo de Q prom y MNF</div>',
+            f'({len(r["eventos_valvula"])} evento(s), Q≈0 con P1 normal) — excluidos del cálculo de Q prom y MNF</div>',
             unsafe_allow_html=True
         )
 
-    if hay_conversion_psi:
-        sensores_psi = " y ".join([n for n, f in [("P1", p1_fue_psi), ("P2", p2_fue_psi)] if f])
+    if r["hay_conversion_psi"]:
+        sensores_psi = " y ".join([n for n, f in [("P1", r["p1_fue_psi"]), ("P2", r["p2_fue_psi"])] if f])
         st.markdown(
             f'<div class="alerta-info">🔁 Presión de {sensores_psi} detectada en psi — convertida automáticamente a bar</div>',
             unsafe_allow_html=True
@@ -444,22 +476,19 @@ if archivo is not None and ejecutar_calculo:
 
     c1, c2, c3, c4, c5, c6 = st.columns(6)
 
-    def kpi(col, t, v):
-        col.markdown(f'<div class="kpi-box"><div class="kpi-title">{t}</div><div class="kpi-value">{v}</div></div>', unsafe_allow_html=True)
-
-    kpi(c1, "P1 (bar)", f"{p1_prom:.2f}")
-    kpi(c2, "P2 (bar)", f"{p2_prom:.2f}")
-    kpi(c3, "Q prom (lps)", f"{q_prom:.2f}")
-    kpi(c4, "Volumen", f"{volumen:.2f} m³")
+    kpi(c1, "P1 (bar)", f"{r['p1_prom']:.2f}")
+    kpi(c2, "P2 (bar)", f"{r['p2_prom']:.2f}")
+    kpi(c3, "Q prom (lps)", f"{r['q_prom']:.2f}")
+    kpi(c4, "Volumen", f"{r['volumen']:.2f} m³")
 
     # Cambiamos dinámicamente el título del KPI si hay tandeo para alertar sobre el pico
-    if es_tandeo and q_pico_apertura is not None:
-        kpi(c5, "Q Pico Apertura (lps)", f"{q_pico_apertura:.2f}")
+    if r["es_tandeo"] and r["q_pico_apertura"] is not None:
+        kpi(c5, "Q Pico Apertura (lps)", f"{r['q_pico_apertura']:.2f}")
     else:
-        kpi(c5, "MNF (lps)", f"{nmf:.2f}" if nmf is not None else "-")
+        kpi(c5, "MNF (lps)", f"{r['nmf']:.2f}" if r["nmf"] is not None else "-")
 
     c6.markdown(
-        f'<div class="kpi-periodo"><div class="kpi-title">Periodo</div><div class="kpi-value">{f_min}<br>–<br>{f_max}</div></div>',
+        f'<div class="kpi-periodo"><div class="kpi-title">Periodo</div><div class="kpi-value">{r["f_min"]}<br>–<br>{r["f_max"]}</div></div>',
         unsafe_allow_html=True
     )
 
@@ -474,12 +503,12 @@ if archivo is not None and ejecutar_calculo:
         st.markdown('<h3 class="section-subtitle">Resumen</h3>', unsafe_allow_html=True)
 
         indicadores_lista = ["P1", "P2", "Q prom", "Volumen", "MNF"]
-        valores_lista = [f"{p1_prom:.2f}", f"{p2_prom:.2f}", f"{q_prom:.2f}", f"{volumen:.2f}", f"{nmf:.2f}" if nmf is not None else "-"]
+        valores_lista = [f"{r['p1_prom']:.2f}", f"{r['p2_prom']:.2f}", f"{r['q_prom']:.2f}", f"{r['volumen']:.2f}", f"{r['nmf']:.2f}" if r["nmf"] is not None else "-"]
         unidades_lista = ["bar", "bar", "lps", "m³", "lps"]
 
-        if es_tandeo and q_pico_apertura is not None:
+        if r["es_tandeo"] and r["q_pico_apertura"] is not None:
             indicadores_lista.append("Q Pico Apertura")
-            valores_lista.append(f"{q_pico_apertura:.2f}")
+            valores_lista.append(f"{r['q_pico_apertura']:.2f}")
             unidades_lista.append("lps")
 
         resumen = pd.DataFrame({
@@ -491,22 +520,23 @@ if archivo is not None and ejecutar_calculo:
 
     with col_grafico:
         fig = go.Figure()
+        q = r["q"]
 
         if not q.empty:
             fig.add_trace(go.Scatter(x=q["FechaHora"], y=q["Valor"], mode="lines", name="Q", line=dict(width=2, color="blue")))
-            fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[q_prom, q_prom], mode="lines", name="Q prom", line=dict(width=1.5, color="red", dash="dot")))
+            fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[r["q_prom"], r["q_prom"]], mode="lines", name="Q prom", line=dict(width=1.5, color="red", dash="dot")))
 
-            if nmf is not None:
-                fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[nmf, nmf], mode="lines", name="MNF", line=dict(width=2, color="green", dash="dash")))
+            if r["nmf"] is not None:
+                fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[r["nmf"], r["nmf"]], mode="lines", name="MNF", line=dict(width=2, color="green", dash="dash")))
 
-            if es_tandeo and q_pico_apertura is not None:
-                fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[q_pico_apertura, q_pico_apertura], mode="lines", name="Pico de Apertura", line=dict(width=1.5, color="purple", dash="longdashdot")))
+            if r["es_tandeo"] and r["q_pico_apertura"] is not None:
+                fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[r["q_pico_apertura"], r["q_pico_apertura"]], mode="lines", name="Pico de Apertura", line=dict(width=1.5, color="purple", dash="longdashdot")))
 
             # Sombreado de los tramos "cerrados" (P1≈0) excluidos del cálculo, para validar visualmente la clasificación
-            if not eventos_p1.empty:
-                color_evento = "rgba(0,68,204,0.15)" if es_tandeo else "rgba(204,0,0,0.15)"
-                nombre_evento = "Tandeo (cerrado)" if es_tandeo else "Falla operacional"
-                for i, (_, ev) in enumerate(eventos_p1.iterrows()):
+            if not r["eventos_p1"].empty:
+                color_evento = "rgba(0,68,204,0.15)" if r["es_tandeo"] else "rgba(204,0,0,0.15)"
+                nombre_evento = "Tandeo (cerrado)" if r["es_tandeo"] else "Falla operacional"
+                for i, (_, ev) in enumerate(r["eventos_p1"].iterrows()):
                     fig.add_vrect(
                         x0=ev["inicio"], x1=ev["fin"],
                         fillcolor=color_evento, opacity=0.5, line_width=0,
@@ -515,8 +545,8 @@ if archivo is not None and ejecutar_calculo:
                     )
 
             # Sombreado de cierres de válvula (Q≈0 con P1 normal) excluidos de Q prom / MNF
-            if not eventos_valvula.empty:
-                for i, (_, ev) in enumerate(eventos_valvula.iterrows()):
+            if not r["eventos_valvula"].empty:
+                for i, (_, ev) in enumerate(r["eventos_valvula"].iterrows()):
                     fig.add_vrect(
                         x0=ev["inicio"], x1=ev["fin"],
                         fillcolor="rgba(255,153,0,0.20)", opacity=0.6, line_width=0,
@@ -531,4 +561,79 @@ if archivo is not None and ejecutar_calculo:
             xaxis=dict(rangeslider=dict(visible=True), type="date"),
             legend=dict(orientation="h", y=1.15, x=0.5, xanchor="center")
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, use_container_width=True, key=f"grafico_{key_prefix}")
+
+def mostrar_dashboard_comparativo(previo, posterior):
+    """Dashboard comparativo Previo/Posterior a gestión de presiones, con ahorro proyectado por diferencia de MNF."""
+    st.markdown("### Ahorro Estimado por Gestión de Presiones")
+
+    if previo["nmf"] is not None and posterior["nmf"] is not None:
+        delta_mnf = previo["nmf"] - posterior["nmf"]
+        volumen_ahorrado = delta_mnf * FACTOR_ANUAL_LPS_A_M3
+    else:
+        delta_mnf = None
+        volumen_ahorrado = None
+
+    ca, cb, cc, cd = st.columns(4)
+
+    kpi(ca, "MNF Previo (lps)", f"{previo['nmf']:.2f}" if previo["nmf"] is not None else "-")
+    kpi(cb, "MNF Posterior (lps)", f"{posterior['nmf']:.2f}" if posterior["nmf"] is not None else "-")
+    kpi(cc, "ΔMNF (lps)", f"{delta_mnf:.2f}" if delta_mnf is not None else "-")
+    kpi(cd, "Volumen Ahorrado Proyectado / año", f"{volumen_ahorrado:,.0f} m³" if volumen_ahorrado is not None else "-", clase_extra="kpi-ahorro")
+
+    st.markdown(
+        '<p style="font-size:12px; color:#64748B; margin-top:4px;">'
+        'Estimado con el principio de diferencia de MNF: se asume que la reducción del caudal mínimo nocturno '
+        '(atribuible a menores fugas por menor presión) se mantiene las 24 horas del día, todos los días del año.</p>',
+        unsafe_allow_html=True
+    )
+
+    st.markdown('<div class="compact-divider"></div>', unsafe_allow_html=True)
+
+    st.markdown("### 📅 Previo a la gestión de presiones")
+    mostrar_dashboard(previo, key_prefix="previo")
+
+    st.markdown('<div class="compact-divider"></div>', unsafe_allow_html=True)
+
+    st.markdown("### 📅 Posterior a la gestión de presiones")
+    mostrar_dashboard(posterior, key_prefix="posterior")
+
+# =====================================================
+# SIDEBAR
+# =====================================================
+
+with st.sidebar:
+    st.image("logo.png", width=160)
+    st.markdown("""
+    Calcula automáticamente desde la hoja de excel de cualquier ConDor de SkyPlatform:
+    - **Presión aguas arriba** (bar)
+    - **Presión aguas abajo** (bar)
+    - **Caudal promedio** (lps)
+    - **Volumen total** ($m^3$)
+    - **MNF** (Minimum Night Flow)
+
+    Sube un solo archivo para ver sus indicadores, o sube **ambos** (previo y posterior a una gestión de presiones) para ver el ahorro proyectado.
+    """)
+    st.write("---")
+    archivo_previo = st.file_uploader("Archivo Previo a la gestión de presiones", type=["xlsx"], key="archivo_previo")
+    archivo_posterior = st.file_uploader("Archivo Posterior a la gestión de presiones", type=["xlsx"], key="archivo_posterior")
+    ejecutar_calculo = st.button("▶ Ejecutar cálculo")
+
+# =====================================================
+# INTERFAZ PRINCIPAL
+# =====================================================
+
+st.title("Dashboard de Indicadores en un DMA")
+
+if archivo_previo is None and archivo_posterior is None:
+    st.info("Carga uno o dos archivos desde el panel izquierdo y presiona 'Ejecutar cálculo'.")
+
+if (archivo_previo is not None or archivo_posterior is not None) and ejecutar_calculo:
+    if archivo_previo is not None and archivo_posterior is not None:
+        resultado_previo = procesar_archivo(archivo_previo)
+        resultado_posterior = procesar_archivo(archivo_posterior)
+        mostrar_dashboard_comparativo(resultado_previo, resultado_posterior)
+    else:
+        archivo_unico = archivo_previo if archivo_previo is not None else archivo_posterior
+        resultado = procesar_archivo(archivo_unico)
+        mostrar_dashboard(resultado)
