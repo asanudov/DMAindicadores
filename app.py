@@ -324,8 +324,8 @@ with st.sidebar:
     st.image("logo.png", width=160)
     st.markdown("""
     Calcula automáticamente desde la hoja de excel de cualquier ConDor de SkyPlatform:
-    - **Presión aguas arriba** (bar)
-    - **Presión aguas abajo** (bar)
+    - **Presión aguas arriba** (bar o psi)
+    - **Presión aguas abajo** (bar o psi)
     - **Caudal promedio** (lps)
     - **Volumen total** ($m^3$)
     - **MNF** (Minimum Night Flow)
