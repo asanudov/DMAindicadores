@@ -118,6 +118,17 @@ st.markdown(
         border: 1px solid #CBD5E1;
     }
 
+    .alerta-ventana {
+        background-color: #EAF7EE;
+        color: #1F7A4D;
+        padding: 8px 12px;
+        border-radius: 6px;
+        font-size: 14px;
+        font-weight: 600;
+        margin-bottom: 10px;
+        border: 1px solid #8FD9A8;
+    }
+
     /* Sustituto compacto para st.divider() */
     .compact-divider {
         border-top: 1px solid #e6e6e6;
@@ -212,6 +223,9 @@ UMBRAL_PSI_DETECCION = 25       # bar. Si el promedio de una serie de presión s
 FACTOR_ANUAL_LPS_A_M3 = 3600 * 24 * 365 / 1000   # convierte una diferencia de caudal sostenida (lps) a m³/año
 FACTOR_DIARIO_LPS_A_M3 = 3600 * 24 / 1000        # convierte una diferencia de caudal sostenida (lps) a m³/día
 MIN_NOCHES_REGRESION_N1 = 4     # mínimo de noches con P2/Q válidos en ambos periodos para ajustar N1 por regresión
+
+MIN_DIAS_VENTANA_VALIDA = 5     # días mínimos que debe tener un tramo continuo sin tandeos/fallas/cierres para usarlo como ventana de análisis
+MARGEN_EVENTO_VENTANA_MIN = 30  # minutos. Solo los eventos de al menos esta duración cuentan como "día problemático" al buscar la ventana
 
 # =====================================================
 # FUNCIONES DE APOYO
@@ -500,6 +514,56 @@ def estimar_carl_uarl(mnf_lps, ili):
     return {"ili": float(ili), "carl_aprox": float(carl), "uarl": float(uarl), "margen_teorico": float(margen_teorico)}
 
 
+def encontrar_ventana_valida(f_min, f_max, eventos_p1, eventos_valvula,
+                              min_dias=MIN_DIAS_VENTANA_VALIDA, margen_min=MARGEN_EVENTO_VENTANA_MIN):
+    """
+    Dentro de todo el archivo, busca el tramo continuo de días más largo que no tenga tandeos,
+    fallas operacionales (P1≈0) ni cierres de válvula — para no mezclar, en un mismo promedio,
+    un periodo inestable (por ejemplo mientras se ajustaba la operación del sector) con el
+    periodo realmente representativo. Si no hay un tramo de al menos `min_dias` días sin estos
+    eventos, devuelve None y se usa el archivo completo (comportamiento anterior).
+
+    Solo cuentan como "día problemático" los eventos de al menos `margen_min` minutos, para no
+    fragmentar un tramo bueno por una sola lectura ruidosa de 15-30 minutos.
+    En empates de longitud, se prefiere el tramo más reciente (más cercano al final del archivo).
+    """
+    if f_min is None or f_max is None:
+        return None
+    dias = pd.date_range(f_min.normalize(), f_max.normalize(), freq="D")
+    if len(dias) < min_dias:
+        return None
+
+    malo = pd.Series(False, index=range(len(dias)))
+    for eventos in (eventos_p1, eventos_valvula):
+        if eventos is None or eventos.empty:
+            continue
+        largos = eventos[eventos["duracion_h"] * 60 >= margen_min]
+        for _, ev in largos.iterrows():
+            ini_d = ev["inicio"].normalize()
+            fin_d = ev["fin"].normalize()
+            malo[(dias >= ini_d) & (dias <= fin_d)] = True
+
+    mejor_ini = mejor_fin = None
+    mejor_len = 0
+    i, n = 0, len(dias)
+    while i < n:
+        if malo.iloc[i]:
+            i += 1
+            continue
+        j = i
+        while j < n and not malo.iloc[j]:
+            j += 1
+        largo = j - i
+        if largo >= mejor_len:
+            mejor_len = largo
+            mejor_ini, mejor_fin = dias[i], dias[j - 1]
+        i = j
+
+    if mejor_len < min_dias:
+        return None
+    return mejor_ini, mejor_fin + pd.Timedelta(hours=23, minutes=59, seconds=59)
+
+
 def procesar_archivo(archivo):
     """Lee un Excel de ConDor y devuelve un dict con todos los indicadores/insumos para renderizar el dashboard."""
     df_raw = pd.read_excel(archivo)
@@ -519,8 +583,33 @@ def procesar_archivo(archivo):
     p2, p2_fue_psi = convertir_si_es_psi(p2)
     hay_conversion_psi = p1_fue_psi or p2_fue_psi
 
-    # Detección de eventos de P1≈0 y clasificación de patrón (tandeo vs falla operacional)
-    dias_totales = df_raw["FechaHora"].dt.date.nunique()
+    f_min_archivo = df_raw["FechaHora"].min() if not df_raw.empty else None
+    f_max_archivo = df_raw["FechaHora"].max() if not df_raw.empty else None
+
+    # --- Selección automática de la ventana de análisis válida ---
+    # Se detectan primero los eventos sobre TODO el archivo, para ubicar el tramo continuo más
+    # largo sin tandeos/fallas/cierres de válvula, y se restringe el resto del análisis a ese
+    # tramo (ver encontrar_ventana_valida). Si el archivo ya es estable de principio a fin, la
+    # ventana coincide con el archivo completo y no cambia nada del comportamiento anterior.
+    eventos_p1_archivo = construir_eventos_cero(p1, UMBRAL_P1)
+    eventos_valvula_archivo = construir_eventos_cierre_valvula(q, p1)
+    ventana = encontrar_ventana_valida(f_min_archivo, f_max_archivo, eventos_p1_archivo, eventos_valvula_archivo)
+
+    ventana_restringida = False
+    dias_excluidos_antes = dias_excluidos_despues = 0
+    if ventana is not None:
+        v_ini, v_fin = ventana
+        if v_ini > f_min_archivo or v_fin < f_max_archivo:
+            ventana_restringida = True
+            dias_excluidos_antes = max((v_ini - f_min_archivo).days, 0)
+            dias_excluidos_despues = max((f_max_archivo - v_fin).days, 0)
+            p1 = p1[(p1["FechaHora"] >= v_ini) & (p1["FechaHora"] <= v_fin)]
+            p2 = p2[(p2["FechaHora"] >= v_ini) & (p2["FechaHora"] <= v_fin)]
+            q = q[(q["FechaHora"] >= v_ini) & (q["FechaHora"] <= v_fin)]
+
+    # Detección de eventos de P1≈0 y clasificación de patrón (tandeo vs falla operacional),
+    # ya dentro de la ventana de análisis seleccionada (o del archivo completo si no se restringió).
+    dias_totales = p1["FechaHora"].dt.date.nunique() if not p1.empty else (q["FechaHora"].dt.date.nunique() if not q.empty else 0)
     eventos_p1 = construir_eventos_cero(p1, UMBRAL_P1)
     patron = clasificar_patron(eventos_p1, dias_totales)
 
@@ -571,11 +660,28 @@ def procesar_archivo(archivo):
     nmf = float(valles_nocturnos["Q_valle"].mean()) if not valles_nocturnos.empty else None
     ventana_nocturna = ventana_nocturna_promedio(valles_nocturnos)
 
+    ventana_nota = None
+    if ventana_restringida:
+        partes = []
+        if dias_excluidos_antes > 0:
+            partes.append(f"{dias_excluidos_antes} día(s) antes del {f_min}")
+        if dias_excluidos_despues > 0:
+            partes.append(f"{dias_excluidos_despues} día(s) después del {f_max}")
+        ventana_nota = (
+            f"🔎 Ventana de análisis ajustada automáticamente: se excluyeron "
+            f"{' y '.join(partes)} por tandeos, fallas operacionales o cierres de válvula "
+            f"frecuentes en ese tramo. Se analizó el periodo {f_min} – {f_max} "
+            f"({dias_totales} días), el tramo continuo más largo sin esos problemas."
+        )
+
     return {
         "p1_prom": p1_prom, "p2_prom": p2_prom, "q_prom": q_prom, "volumen": volumen,
         "nmf": nmf, "f_min": f_min, "f_max": f_max,
         "f_min_raw": f_min_raw, "f_max_raw": f_max_raw,
         "f_min_valido": f_min_valido, "f_max_valido": f_max_valido,
+        "f_min_archivo": f_min_archivo, "f_max_archivo": f_max_archivo,
+        "ventana_restringida": ventana_restringida, "ventana_nota": ventana_nota,
+        "dias_excluidos_antes": dias_excluidos_antes, "dias_excluidos_despues": dias_excluidos_despues,
         "ventana_nocturna": ventana_nocturna, "valles_nocturnos": valles_nocturnos,
         "es_tandeo": es_tandeo, "hay_falla_operacional": hay_falla_operacional,
         "hay_cierre_valvula": hay_cierre_valvula, "hay_conversion_psi": hay_conversion_psi,
@@ -665,6 +771,9 @@ def mostrar_dashboard(r, key_prefix=""):
     """Renderiza alertas + KPIs + tabla resumen + gráfico para un resultado de procesar_archivo()."""
     st.markdown("### Indicadores del Sector")
 
+    if r.get("ventana_restringida") and r.get("ventana_nota"):
+        st.markdown(f'<div class="alerta-ventana">{r["ventana_nota"]}</div>', unsafe_allow_html=True)
+
     if r["es_tandeo"]:
         frac_dias = r["eventos_p1"]["fecha"].nunique() / r["dias_totales"]
         hora_prom = r["eventos_p1"]["hora_inicio"].mean()
@@ -706,8 +815,9 @@ def mostrar_dashboard(r, key_prefix=""):
     else:
         kpi(c5, "MNF (lps)", f"{r['nmf']:.2f}" if r["nmf"] is not None else "-")
 
+    titulo_periodo = "Periodo analizado" if r.get("ventana_restringida") else "Periodo"
     c6.markdown(
-        f'<div class="kpi-periodo"><div class="kpi-title">Periodo</div><div class="kpi-value">{r["f_min"]}<br>–<br>{r["f_max"]}</div></div>',
+        f'<div class="kpi-periodo"><div class="kpi-title">{titulo_periodo}</div><div class="kpi-value">{r["f_min"]}<br>–<br>{r["f_max"]}</div></div>',
         unsafe_allow_html=True
     )
 
@@ -813,16 +923,37 @@ def generar_pdf_reporte(resultado_previo, resultado_posterior, ili=None, out_pat
     story.append(Paragraph(f"Generado el {datetime.now().strftime('%d/%m/%Y %H:%M')}", styles["Subtitulo"]))
 
     story.append(Paragraph("Periodos analizados", styles["H2"]))
-    story.append(_tabla_kv([
+    filas_periodos = [
         ("Periodo de datos — previo a la gestión (archivo completo)",
-         f"{_fecha_hora(resultado_previo['f_min_raw'])} &nbsp;–&nbsp; {_fecha_hora(resultado_previo['f_max_raw'])}"),
+         f"{_fecha_hora(resultado_previo.get('f_min_archivo'))} &nbsp;–&nbsp; {_fecha_hora(resultado_previo.get('f_max_archivo'))}"),
         ("Periodo de datos — posterior a la gestión (archivo completo)",
-         f"{_fecha_hora(resultado_posterior['f_min_raw'])} &nbsp;–&nbsp; {_fecha_hora(resultado_posterior['f_max_raw'])}"),
+         f"{_fecha_hora(resultado_posterior.get('f_min_archivo'))} &nbsp;–&nbsp; {_fecha_hora(resultado_posterior.get('f_max_archivo'))}"),
+    ]
+    if resultado_previo.get("ventana_restringida"):
+        filas_periodos.append((
+            "Ventana de análisis — previo (seleccionada automáticamente, excluye tramo inestable)",
+            f"{_fecha_hora(resultado_previo['f_min_raw'])} &nbsp;–&nbsp; {_fecha_hora(resultado_previo['f_max_raw'])}",
+        ))
+    if resultado_posterior.get("ventana_restringida"):
+        filas_periodos.append((
+            "Ventana de análisis — posterior (seleccionada automáticamente, excluye tramo inestable)",
+            f"{_fecha_hora(resultado_posterior['f_min_raw'])} &nbsp;–&nbsp; {_fecha_hora(resultado_posterior['f_max_raw'])}",
+        ))
+    filas_periodos += [
         ("Periodo de fechas VÁLIDO — previo a la gestión (excluye tramos cerrados/tandeo/falla)",
          f"{_fecha_hora(resultado_previo['f_min_valido'])} &nbsp;–&nbsp; {_fecha_hora(resultado_previo['f_max_valido'])}"),
         ("Periodo de fechas VÁLIDO — posterior a la gestión (excluye tramos cerrados/tandeo/falla)",
          f"{_fecha_hora(resultado_posterior['f_min_valido'])} &nbsp;–&nbsp; {_fecha_hora(resultado_posterior['f_max_valido'])}"),
-    ]))
+    ]
+    story.append(_tabla_kv(filas_periodos))
+    if resultado_previo.get("ventana_restringida") or resultado_posterior.get("ventana_restringida"):
+        story.append(Paragraph(
+            "Cuando el archivo tiene un tramo largo con tandeos, fallas operacionales o cierres de "
+            "válvula frecuentes, la plataforma selecciona automáticamente el tramo continuo más largo "
+            "sin esos problemas y restringe todo el análisis (indicadores, MNF, N1, gráficas) a esa "
+            "ventana, en vez de mezclarlo con el periodo inestable.",
+            styles["Nota"]
+        ))
 
     story.append(Paragraph("Horario considerado como gestión nocturna", styles["H2"]))
     story.append(Paragraph(
