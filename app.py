@@ -226,6 +226,8 @@ MIN_NOCHES_REGRESION_N1 = 4     # mínimo de noches con P2/Q válidos en ambos p
 
 MIN_DIAS_VENTANA_VALIDA = 5     # días mínimos que debe tener un tramo continuo sin tandeos/fallas/cierres para usarlo como ventana de análisis
 MARGEN_EVENTO_VENTANA_MIN = 30  # minutos. Solo los eventos de al menos esta duración cuentan como "día problemático" al buscar la ventana
+FRAC_AMPLITUD_MIN_CICLO = 0.25  # fracción mínima (vs. el rango típico de Q del archivo) que debe tener el rango diario de Q para considerar que ese día muestra el ciclo día-noche habitual
+MIN_LECTURAS_DIA_CICLO = 20     # lecturas mínimas en un día para evaluar su amplitud de Q con confianza
 
 # =====================================================
 # FUNCIONES DE APOYO
@@ -514,24 +516,67 @@ def estimar_carl_uarl(mnf_lps, ili):
     return {"ili": float(ili), "carl_aprox": float(carl), "uarl": float(uarl), "margen_teorico": float(margen_teorico)}
 
 
-def encontrar_ventana_valida(f_min, f_max, eventos_p1, eventos_valvula,
-                              min_dias=MIN_DIAS_VENTANA_VALIDA, margen_min=MARGEN_EVENTO_VENTANA_MIN):
+def _dias_sin_ciclo(q_df, dias, frac_amplitud=FRAC_AMPLITUD_MIN_CICLO, min_lecturas=MIN_LECTURAS_DIA_CICLO):
     """
-    Dentro de todo el archivo, busca el tramo continuo de días más largo que no tenga tandeos,
-    fallas operacionales (P1≈0) ni cierres de válvula — para no mezclar, en un mismo promedio,
-    un periodo inestable (por ejemplo mientras se ajustaba la operación del sector) con el
-    periodo realmente representativo. Si no hay un tramo de al menos `min_dias` días sin estos
-    eventos, devuelve None y se usa el archivo completo (comportamiento anterior).
+    Marca como "problemático" cada día cuyo caudal no muestra el ciclo día-noche habitual (rango
+    diario muy por debajo del rango típico del archivo) — por ejemplo, una válvula atascada
+    completamente abierta (o cerrada) durante semanas, sin los picos/valles normales, aunque no
+    haya un "evento" puntual de P1≈0 ni de cierre de válvula detectado en ese tramo (porque el
+    caudal nunca llega a 0, simplemente deja de variar).
+
+    El rango típico del archivo se toma como percentil 98 − percentil 2 de todo el caudal (robusto
+    a picos de una sola lectura), y un día se marca "sin ciclo" si su propio rango (percentil 95 −
+    percentil 5 de ese día) queda por debajo de `frac_amplitud` de ese rango típico, o si tiene
+    menos de `min_lecturas` registros (día incompleto / con hueco de datos).
+    """
+    malo = pd.Series(False, index=range(len(dias)))
+    if q_df is None or q_df.empty:
+        return malo
+
+    d = q_df.dropna(subset=["Valor"]).copy()
+    if d.empty:
+        return malo
+    d["fecha"] = d["FechaHora"].dt.normalize()
+
+    rango_global = d["Valor"].quantile(0.98) - d["Valor"].quantile(0.02)
+    if not np.isfinite(rango_global) or rango_global <= 0:
+        return malo
+    umbral = frac_amplitud * rango_global
+
+    por_dia = d.groupby("fecha")["Valor"].agg(
+        n="count",
+        rango=lambda s: s.quantile(0.95) - s.quantile(0.05),
+    )
+    dias_malos = set(por_dia[(por_dia["n"] < min_lecturas) | (por_dia["rango"] < umbral)].index)
+
+    idx_por_fecha = {fecha: i for i, fecha in enumerate(dias)}
+    for fecha in dias_malos:
+        i = idx_por_fecha.get(pd.Timestamp(fecha))
+        if i is not None:
+            malo.iloc[i] = True
+    return malo
+
+
+def encontrar_ventanas_validas(f_min, f_max, q_df, eventos_p1, eventos_valvula,
+                                min_dias=MIN_DIAS_VENTANA_VALIDA, margen_min=MARGEN_EVENTO_VENTANA_MIN):
+    """
+    Dentro de todo el archivo, busca TODOS los tramos continuos de al menos `min_dias` días que no
+    tengan tandeos, fallas operacionales (P1≈0), cierres de válvula, ni días sin el ciclo día-noche
+    habitual (ver `_dias_sin_ciclo`) — para no mezclar, en un mismo promedio, periodos inestables
+    (por ejemplo mientras se ajustaba la operación del sector, o con la válvula atascada) con los
+    periodos realmente representativos. Puede devolver más de un tramo si el archivo tiene varios
+    periodos estables separados por tramos problemáticos (p. ej. antes y después de un ajuste
+    operativo a mitad del archivo). Si no hay ningún tramo de al menos `min_dias` días, devuelve una
+    lista vacía y se usa el archivo completo (comportamiento anterior).
 
     Solo cuentan como "día problemático" los eventos de al menos `margen_min` minutos, para no
     fragmentar un tramo bueno por una sola lectura ruidosa de 15-30 minutos.
-    En empates de longitud, se prefiere el tramo más reciente (más cercano al final del archivo).
     """
     if f_min is None or f_max is None:
-        return None
+        return []
     dias = pd.date_range(f_min.normalize(), f_max.normalize(), freq="D")
     if len(dias) < min_dias:
-        return None
+        return []
 
     malo = pd.Series(False, index=range(len(dias)))
     for eventos in (eventos_p1, eventos_valvula):
@@ -543,8 +588,9 @@ def encontrar_ventana_valida(f_min, f_max, eventos_p1, eventos_valvula,
             fin_d = ev["fin"].normalize()
             malo[(dias >= ini_d) & (dias <= fin_d)] = True
 
-    mejor_ini = mejor_fin = None
-    mejor_len = 0
+    malo = malo | _dias_sin_ciclo(q_df, dias)
+
+    ventanas = []
     i, n = 0, len(dias)
     while i < n:
         if malo.iloc[i]:
@@ -554,14 +600,27 @@ def encontrar_ventana_valida(f_min, f_max, eventos_p1, eventos_valvula,
         while j < n and not malo.iloc[j]:
             j += 1
         largo = j - i
-        if largo >= mejor_len:
-            mejor_len = largo
-            mejor_ini, mejor_fin = dias[i], dias[j - 1]
+        if largo >= min_dias:
+            ventanas.append((dias[i], dias[j - 1] + pd.Timedelta(hours=23, minutes=59, seconds=59)))
         i = j
 
-    if mejor_len < min_dias:
-        return None
-    return mejor_ini, mejor_fin + pd.Timedelta(hours=23, minutes=59, seconds=59)
+    return ventanas
+
+
+def _insertar_cortes_grafica(q, ventanas):
+    """
+    Inserta una fila con Valor=NaN justo entre cada par de ventanas de análisis consecutivas, para
+    que la gráfica muestre un corte real (en vez de una línea recta uniendo el final de un tramo
+    estable con el inicio del siguiente) en los tramos excluidos entre ellas.
+    """
+    if q.empty or len(ventanas) < 2:
+        return q
+    cortes = []
+    for (_, fin_act), (ini_sig, _) in zip(ventanas[:-1], ventanas[1:]):
+        t_corte = fin_act + (ini_sig - fin_act) / 2
+        cortes.append({"FechaHora": t_corte, "Valor": np.nan})
+    q_cortado = pd.concat([q, pd.DataFrame(cortes)], ignore_index=True).sort_values("FechaHora").reset_index(drop=True)
+    return q_cortado
 
 
 def procesar_archivo(archivo):
@@ -586,26 +645,38 @@ def procesar_archivo(archivo):
     f_min_archivo = df_raw["FechaHora"].min() if not df_raw.empty else None
     f_max_archivo = df_raw["FechaHora"].max() if not df_raw.empty else None
 
-    # --- Selección automática de la ventana de análisis válida ---
-    # Se detectan primero los eventos sobre TODO el archivo, para ubicar el tramo continuo más
-    # largo sin tandeos/fallas/cierres de válvula, y se restringe el resto del análisis a ese
-    # tramo (ver encontrar_ventana_valida). Si el archivo ya es estable de principio a fin, la
-    # ventana coincide con el archivo completo y no cambia nada del comportamiento anterior.
+    # --- Selección automática de la(s) ventana(s) de análisis válida(s) ---
+    # Se detectan primero los eventos y el patrón de ciclo día-noche sobre TODO el archivo, para
+    # ubicar TODOS los tramos continuos estables (puede haber más de uno, p.ej. antes y después de
+    # un tramo con la válvula atascada), y se restringe el resto del análisis a la unión de esos
+    # tramos (ver encontrar_ventanas_validas). Si el archivo ya es estable de principio a fin, el
+    # único tramo encontrado coincide con el archivo completo y no cambia nada del comportamiento
+    # anterior.
     eventos_p1_archivo = construir_eventos_cero(p1, UMBRAL_P1)
     eventos_valvula_archivo = construir_eventos_cierre_valvula(q, p1)
-    ventana = encontrar_ventana_valida(f_min_archivo, f_max_archivo, eventos_p1_archivo, eventos_valvula_archivo)
+    ventanas = encontrar_ventanas_validas(f_min_archivo, f_max_archivo, q, eventos_p1_archivo, eventos_valvula_archivo)
 
-    ventana_restringida = False
-    dias_excluidos_antes = dias_excluidos_despues = 0
-    if ventana is not None:
-        v_ini, v_fin = ventana
-        if v_ini > f_min_archivo or v_fin < f_max_archivo:
-            ventana_restringida = True
-            dias_excluidos_antes = max((v_ini - f_min_archivo).days, 0)
-            dias_excluidos_despues = max((f_max_archivo - v_fin).days, 0)
-            p1 = p1[(p1["FechaHora"] >= v_ini) & (p1["FechaHora"] <= v_fin)]
-            p2 = p2[(p2["FechaHora"] >= v_ini) & (p2["FechaHora"] <= v_fin)]
-            q = q[(q["FechaHora"] >= v_ini) & (q["FechaHora"] <= v_fin)]
+    if not ventanas:
+        ventanas = [(f_min_archivo, f_max_archivo)] if f_min_archivo is not None else []
+
+    if f_min_archivo is not None and ventanas:
+        dias_archivo = (f_max_archivo.normalize() - f_min_archivo.normalize()).days + 1
+        dias_incluidos = sum((min(v[1], f_max_archivo).normalize() - v[0].normalize()).days + 1 for v in ventanas)
+        ventana_restringida = dias_incluidos < dias_archivo
+    else:
+        ventana_restringida = False
+
+    if ventana_restringida:
+        mask_p1 = pd.Series(False, index=p1.index)
+        mask_p2 = pd.Series(False, index=p2.index)
+        mask_q = pd.Series(False, index=q.index)
+        for v_ini, v_fin in ventanas:
+            mask_p1 |= (p1["FechaHora"] >= v_ini) & (p1["FechaHora"] <= v_fin)
+            mask_p2 |= (p2["FechaHora"] >= v_ini) & (p2["FechaHora"] <= v_fin)
+            mask_q |= (q["FechaHora"] >= v_ini) & (q["FechaHora"] <= v_fin)
+        p1 = p1[mask_p1]
+        p2 = p2[mask_p2]
+        q = q[mask_q]
 
     # Detección de eventos de P1≈0 y clasificación de patrón (tandeo vs falla operacional),
     # ya dentro de la ventana de análisis seleccionada (o del archivo completo si no se restringió).
@@ -662,17 +733,19 @@ def procesar_archivo(archivo):
 
     ventana_nota = None
     if ventana_restringida:
-        partes = []
-        if dias_excluidos_antes > 0:
-            partes.append(f"{dias_excluidos_antes} día(s) antes del {f_min}")
-        if dias_excluidos_despues > 0:
-            partes.append(f"{dias_excluidos_despues} día(s) después del {f_max}")
+        partes_tramos = [f"{v_ini.strftime('%d/%m/%Y')}–{v_fin.strftime('%d/%m/%Y')}" for v_ini, v_fin in ventanas]
+        if len(partes_tramos) > 1:
+            texto_tramos = ", ".join(partes_tramos[:-1]) + " y " + partes_tramos[-1]
+        else:
+            texto_tramos = partes_tramos[0]
         ventana_nota = (
-            f"🔎 Ventana de análisis ajustada automáticamente: se excluyeron "
-            f"{' y '.join(partes)} por tandeos, fallas operacionales o cierres de válvula "
-            f"frecuentes en ese tramo. Se analizó el periodo {f_min} – {f_max} "
-            f"({dias_totales} días), el tramo continuo más largo sin esos problemas."
+            f"🔎 Análisis restringido automáticamente a {len(ventanas)} tramo(s) estable(s) "
+            f"({dias_totales} día(s) en total): {texto_tramos}. Se excluyó el resto del archivo por "
+            f"tandeos, fallas operacionales, cierres de válvula, o días sin el ciclo día-noche "
+            f"habitual (p. ej. válvula atascada abierta o cerrada por un tramo largo)."
         )
+
+    q_grafica = _insertar_cortes_grafica(q[["FechaHora", "Valor"]], ventanas) if ventana_restringida and not q.empty else q
 
     return {
         "p1_prom": p1_prom, "p2_prom": p2_prom, "q_prom": q_prom, "volumen": volumen,
@@ -681,14 +754,14 @@ def procesar_archivo(archivo):
         "f_min_valido": f_min_valido, "f_max_valido": f_max_valido,
         "f_min_archivo": f_min_archivo, "f_max_archivo": f_max_archivo,
         "ventana_restringida": ventana_restringida, "ventana_nota": ventana_nota,
-        "dias_excluidos_antes": dias_excluidos_antes, "dias_excluidos_despues": dias_excluidos_despues,
+        "ventanas": ventanas,
         "ventana_nocturna": ventana_nocturna, "valles_nocturnos": valles_nocturnos,
         "es_tandeo": es_tandeo, "hay_falla_operacional": hay_falla_operacional,
         "hay_cierre_valvula": hay_cierre_valvula, "hay_conversion_psi": hay_conversion_psi,
         "p1_fue_psi": p1_fue_psi, "p2_fue_psi": p2_fue_psi,
         "eventos_p1": eventos_p1, "eventos_valvula": eventos_valvula,
         "dias_totales": dias_totales, "q_pico_apertura": q_pico_apertura,
-        "q": q,
+        "q": q, "q_grafica": q_grafica,
     }
 
 
@@ -700,9 +773,10 @@ def graficar_serie(r, titulo=""):
     """Construye la gráfica de caudal de un periodo (misma lógica visual que mostrar_dashboard, mode reusable: también la usa el PDF)."""
     fig = go.Figure()
     q = r["q"]
+    q_plot = r.get("q_grafica", q)
 
     if not q.empty:
-        fig.add_trace(go.Scatter(x=q["FechaHora"], y=q["Valor"], mode="lines", name="Q", line=dict(width=2, color="blue")))
+        fig.add_trace(go.Scatter(x=q_plot["FechaHora"], y=q_plot["Valor"], mode="lines", name="Q", line=dict(width=2, color="blue"), connectgaps=False))
         fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[r["q_prom"], r["q_prom"]], mode="lines", name="Q prom", line=dict(width=1.5, color="red", dash="dot")))
 
         if r["nmf"] is not None:
@@ -711,25 +785,44 @@ def graficar_serie(r, titulo=""):
         if r["es_tandeo"] and r["q_pico_apertura"] is not None:
             fig.add_trace(go.Scatter(x=[q["FechaHora"].min(), q["FechaHora"].max()], y=[r["q_pico_apertura"], r["q_pico_apertura"]], mode="lines", name="Pico de Apertura", line=dict(width=1.5, color="purple", dash="longdashdot")))
 
+        if r.get("ventana_restringida") and len(r.get("ventanas", [])) > 1:
+            for i, ((_, fin_act), (ini_sig, _)) in enumerate(zip(r["ventanas"][:-1], r["ventanas"][1:])):
+                if i == 0:
+                    fig.add_vrect(
+                        x0=fin_act, x1=ini_sig,
+                        fillcolor="rgba(100,116,139,0.12)", opacity=0.6, line_width=0,
+                        annotation_text="Tramo excluido",
+                        annotation_position="top left"
+                    )
+                else:
+                    fig.add_vrect(
+                        x0=fin_act, x1=ini_sig,
+                        fillcolor="rgba(100,116,139,0.12)", opacity=0.6, line_width=0,
+                    )
+
         if not r["eventos_p1"].empty:
             color_evento = "rgba(0,68,204,0.15)" if r["es_tandeo"] else "rgba(204,0,0,0.15)"
             nombre_evento = "Tandeo (cerrado)" if r["es_tandeo"] else "Falla operacional"
             for i, (_, ev) in enumerate(r["eventos_p1"].iterrows()):
-                fig.add_vrect(
-                    x0=ev["inicio"], x1=ev["fin"],
-                    fillcolor=color_evento, opacity=0.5, line_width=0,
-                    annotation_text=nombre_evento if i == 0 else None,
-                    annotation_position="top left"
-                )
+                if i == 0:
+                    fig.add_vrect(
+                        x0=ev["inicio"], x1=ev["fin"],
+                        fillcolor=color_evento, opacity=0.5, line_width=0,
+                        annotation_text=nombre_evento, annotation_position="top left"
+                    )
+                else:
+                    fig.add_vrect(x0=ev["inicio"], x1=ev["fin"], fillcolor=color_evento, opacity=0.5, line_width=0)
 
         if not r["eventos_valvula"].empty:
             for i, (_, ev) in enumerate(r["eventos_valvula"].iterrows()):
-                fig.add_vrect(
-                    x0=ev["inicio"], x1=ev["fin"],
-                    fillcolor="rgba(255,153,0,0.20)", opacity=0.6, line_width=0,
-                    annotation_text="Cierre de válvula" if i == 0 else None,
-                    annotation_position="bottom left"
-                )
+                if i == 0:
+                    fig.add_vrect(
+                        x0=ev["inicio"], x1=ev["fin"],
+                        fillcolor="rgba(255,153,0,0.20)", opacity=0.6, line_width=0,
+                        annotation_text="Cierre de válvula", annotation_position="bottom left"
+                    )
+                else:
+                    fig.add_vrect(x0=ev["inicio"], x1=ev["fin"], fillcolor="rgba(255,153,0,0.20)", opacity=0.6, line_width=0)
 
     fig.update_layout(
         title=titulo,
@@ -815,9 +908,22 @@ def mostrar_dashboard(r, key_prefix=""):
     else:
         kpi(c5, "MNF (lps)", f"{r['nmf']:.2f}" if r["nmf"] is not None else "-")
 
-    titulo_periodo = "Periodo analizado" if r.get("ventana_restringida") else "Periodo"
+    ventanas_r = r.get("ventanas", [])
+    if r.get("ventana_restringida"):
+        n_tramos = len(ventanas_r)
+        titulo_periodo = f"Periodo analizado ({n_tramos} tramo{'s' if n_tramos != 1 else ''})"
+        if n_tramos == 1:
+            valor_periodo = f"{ventanas_r[0][0].strftime('%d/%m/%y')}<br>–<br>{ventanas_r[0][1].strftime('%d/%m/%y')}"
+        else:
+            valor_periodo = (
+                f"{ventanas_r[0][0].strftime('%d/%m/%y')}<br>–<br>{ventanas_r[-1][1].strftime('%d/%m/%y')}"
+                f'<br><span style="font-size:10px;">(detalle abajo)</span>'
+            )
+    else:
+        titulo_periodo = "Periodo"
+        valor_periodo = f"{r['f_min']}<br>–<br>{r['f_max']}"
     c6.markdown(
-        f'<div class="kpi-periodo"><div class="kpi-title">{titulo_periodo}</div><div class="kpi-value">{r["f_min"]}<br>–<br>{r["f_max"]}</div></div>',
+        f'<div class="kpi-periodo"><div class="kpi-title">{titulo_periodo}</div><div class="kpi-value">{valor_periodo}</div></div>',
         unsafe_allow_html=True
     )
 
@@ -839,6 +945,14 @@ def mostrar_dashboard(r, key_prefix=""):
             indicadores_lista.append("Q Pico Apertura")
             valores_lista.append(f"{r['q_pico_apertura']:.2f}")
             unidades_lista.append("lps")
+
+        if r.get("ventana_restringida"):
+            indicadores_lista.append("Tramos analizados")
+            texto_tramos_tabla = "<br>".join(
+                f"{vi.strftime('%d/%m/%Y')} – {vf.strftime('%d/%m/%Y')}" for vi, vf in r.get("ventanas", [])
+            )
+            valores_lista.append(texto_tramos_tabla)
+            unidades_lista.append("")
 
         resumen = pd.DataFrame({
             "Indicador": indicadores_lista,
@@ -929,16 +1043,17 @@ def generar_pdf_reporte(resultado_previo, resultado_posterior, ili=None, out_pat
         ("Periodo de datos — posterior a la gestión (archivo completo)",
          f"{_fecha_hora(resultado_posterior.get('f_min_archivo'))} &nbsp;–&nbsp; {_fecha_hora(resultado_posterior.get('f_max_archivo'))}"),
     ]
+    def _fecha_sola(ts):
+        return ts.strftime("%d/%m/%Y") if ts is not None else "—"
+
     if resultado_previo.get("ventana_restringida"):
-        filas_periodos.append((
-            "Ventana de análisis — previo (seleccionada automáticamente, excluye tramo inestable)",
-            f"{_fecha_hora(resultado_previo['f_min_raw'])} &nbsp;–&nbsp; {_fecha_hora(resultado_previo['f_max_raw'])}",
-        ))
+        for i, (v_ini, v_fin) in enumerate(resultado_previo.get("ventanas", []), start=1):
+            etiqueta = "Tramo estable — previo" if len(resultado_previo["ventanas"]) == 1 else f"Tramo estable {i}/{len(resultado_previo['ventanas'])} — previo"
+            filas_periodos.append((etiqueta, f"{_fecha_sola(v_ini)} &nbsp;–&nbsp; {_fecha_sola(v_fin)}"))
     if resultado_posterior.get("ventana_restringida"):
-        filas_periodos.append((
-            "Ventana de análisis — posterior (seleccionada automáticamente, excluye tramo inestable)",
-            f"{_fecha_hora(resultado_posterior['f_min_raw'])} &nbsp;–&nbsp; {_fecha_hora(resultado_posterior['f_max_raw'])}",
-        ))
+        for i, (v_ini, v_fin) in enumerate(resultado_posterior.get("ventanas", []), start=1):
+            etiqueta = "Tramo estable — posterior" if len(resultado_posterior["ventanas"]) == 1 else f"Tramo estable {i}/{len(resultado_posterior['ventanas'])} — posterior"
+            filas_periodos.append((etiqueta, f"{_fecha_sola(v_ini)} &nbsp;–&nbsp; {_fecha_sola(v_fin)}"))
     filas_periodos += [
         ("Periodo de fechas VÁLIDO — previo a la gestión (excluye tramos cerrados/tandeo/falla)",
          f"{_fecha_hora(resultado_previo['f_min_valido'])} &nbsp;–&nbsp; {_fecha_hora(resultado_previo['f_max_valido'])}"),
@@ -948,10 +1063,12 @@ def generar_pdf_reporte(resultado_previo, resultado_posterior, ili=None, out_pat
     story.append(_tabla_kv(filas_periodos))
     if resultado_previo.get("ventana_restringida") or resultado_posterior.get("ventana_restringida"):
         story.append(Paragraph(
-            "Cuando el archivo tiene un tramo largo con tandeos, fallas operacionales o cierres de "
-            "válvula frecuentes, la plataforma selecciona automáticamente el tramo continuo más largo "
-            "sin esos problemas y restringe todo el análisis (indicadores, MNF, N1, gráficas) a esa "
-            "ventana, en vez de mezclarlo con el periodo inestable.",
+            "Cuando el archivo tiene uno o varios tramos con tandeos, fallas operacionales, cierres de "
+            "válvula, o días sin el ciclo día-noche habitual (p. ej. válvula atascada abierta o cerrada "
+            "por un tramo largo), la plataforma selecciona automáticamente todos los tramos continuos "
+            "estables de al menos 5 días (puede haber más de uno) y restringe todo el análisis "
+            "(indicadores, MNF, N1, gráficas) a la unión de esos tramos, en vez de mezclarlos con los "
+            "periodos inestables intermedios.",
             styles["Nota"]
         ))
 
