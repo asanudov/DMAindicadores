@@ -1091,22 +1091,27 @@ def generar_pdf_reporte(resultado_previo, resultado_posterior, ili=None, out_pat
     ]))
 
     story.append(Paragraph("Caudal nocturno, volumen y proyección", styles["H2"]))
-    q_prom_previo = resultado_previo["q_prom"]
-    q_prom_post = resultado_posterior["q_prom"]
-    delta_q = q_prom_previo - q_prom_post
-    vol_dia = delta_q * FACTOR_DIARIO_LPS_A_M3
-    vol_anual = delta_q * FACTOR_ANUAL_LPS_A_M3
+    nmf_previo = resultado_previo["nmf"]
+    nmf_post = resultado_posterior["nmf"]
+    if nmf_previo is not None and nmf_post is not None:
+        delta_q = nmf_previo - nmf_post
+        vol_dia = delta_q * FACTOR_DIARIO_LPS_A_M3
+        vol_anual = delta_q * FACTOR_ANUAL_LPS_A_M3
+    else:
+        vol_dia = vol_anual = None
     story.append(_tabla_kv([
-        ("Caudal promedio en horario nocturno — antes (lps)", _num(resultado_previo["nmf"])),
-        ("Caudal promedio en horario nocturno — después (lps)", _num(resultado_posterior["nmf"])),
-        ("Conversión a volumen — diferencia de caudal medio de 24h (m<super>3</super>/día)", _num(vol_dia, 1)),
+        ("Caudal promedio en horario nocturno — antes (lps)", _num(nmf_previo)),
+        ("Caudal promedio en horario nocturno — después (lps)", _num(nmf_post)),
+        ("Conversión a volumen — diferencia de MNF nocturno (m<super>3</super>/día)", _num(vol_dia, 1)),
         ("Proyección a un año (m<super>3</super>/año)", _num(vol_anual, 0)),
     ]))
     story.append(Paragraph(
-        "La conversión a volumen y la proyección anual se calculan con la diferencia del caudal "
-        "promedio de 24 horas entre ambos periodos (Q prom antes − Q prom después), no con el MNF "
-        "nocturno extrapolado de forma plana, porque el porcentaje de ahorro nocturno no siempre "
-        "coincide con el del resto del día.",
+        "La conversión a volumen y la proyección anual se calculan únicamente con la diferencia del "
+        "MNF (caudal mínimo nocturno, en los valles noche-mañana) entre ambos periodos — no con el "
+        "promedio de 24 horas — porque el horario nocturno es la ventana más comparable entre ambos "
+        "periodos: el consumo diurno puede variar por motivos ajenos a la gestión de presiones "
+        "(estacionalidad, demanda, actividad), mientras que de noche el consumo legítimo es más "
+        "estable y la diferencia de caudal refleja mejor el efecto de la gestión de presiones.",
         styles["Nota"]
     ))
 
@@ -1135,7 +1140,7 @@ def generar_pdf_reporte(resultado_previo, resultado_posterior, ili=None, out_pat
             "ingresado por el usuario se despeja el UARL implícito.",
             styles["Cuerpo"]
         ))
-        pct_margen = (vol_anual / carl_uarl["margen_teorico"] * 100) if carl_uarl["margen_teorico"] > 0 else None
+        pct_margen = (vol_anual / carl_uarl["margen_teorico"] * 100) if (vol_anual is not None and carl_uarl["margen_teorico"] > 0) else None
         story.append(_tabla_kv([
             ("Índice de Fugas (ILI) ingresado por el usuario", f"{carl_uarl['ili']:.2f}"),
             ("CARL aproximado — pérdidas reales anuales actuales (m<super>3</super>/año)", _num(carl_uarl["carl_aprox"], 0)),
@@ -1188,22 +1193,27 @@ def mostrar_dashboard_comparativo(previo, posterior, ili=None):
     """Dashboard comparativo Previo/Posterior a gestión de presiones."""
     st.markdown("### Ahorro Estimado por Gestión de Presiones")
 
-    delta_q = previo["q_prom"] - posterior["q_prom"]
-    volumen_ahorrado_anual = delta_q * FACTOR_ANUAL_LPS_A_M3
-    volumen_ahorrado_dia = delta_q * FACTOR_DIARIO_LPS_A_M3
+    if previo["nmf"] is not None and posterior["nmf"] is not None:
+        delta_q = previo["nmf"] - posterior["nmf"]
+        volumen_ahorrado_anual = delta_q * FACTOR_ANUAL_LPS_A_M3
+        volumen_ahorrado_dia = delta_q * FACTOR_DIARIO_LPS_A_M3
+    else:
+        volumen_ahorrado_anual = volumen_ahorrado_dia = None
 
     ca, cb, cc, cd = st.columns(4)
 
     kpi(ca, "MNF Previo (lps)", f"{previo['nmf']:.2f}" if previo["nmf"] is not None else "-")
     kpi(cb, "MNF Posterior (lps)", f"{posterior['nmf']:.2f}" if posterior["nmf"] is not None else "-")
-    kpi(cc, "Volumen Ahorrado / día", f"{volumen_ahorrado_dia:,.1f} m³")
-    kpi(cd, "Volumen Ahorrado Proyectado / año", f"{volumen_ahorrado_anual:,.0f} m³", clase_extra="kpi-ahorro")
+    kpi(cc, "Volumen Ahorrado / día", f"{volumen_ahorrado_dia:,.1f} m³" if volumen_ahorrado_dia is not None else "-")
+    kpi(cd, "Volumen Ahorrado Proyectado / año", f"{volumen_ahorrado_anual:,.0f} m³" if volumen_ahorrado_anual is not None else "-", clase_extra="kpi-ahorro")
 
     st.markdown(
         '<p style="font-size:12px; color:#64748B; margin-top:4px;">'
-        'El volumen se calcula con la diferencia del caudal promedio de 24 horas entre ambos periodos '
-        '(Q prom antes − Q prom después), no con la diferencia de MNF extrapolada de forma plana, '
-        'porque el porcentaje de ahorro nocturno no siempre coincide con el del resto del día.</p>',
+        'El volumen se calcula únicamente con la diferencia del MNF (caudal mínimo nocturno, en los '
+        'valles noche-mañana) entre ambos periodos — no con el promedio de 24 horas — porque el '
+        'horario nocturno es la ventana más comparable entre ambos periodos: el consumo diurno puede '
+        'variar por motivos ajenos a la gestión de presiones (estacionalidad, demanda, actividad), '
+        'mientras que de noche el consumo legítimo es más estable.</p>',
         unsafe_allow_html=True
     )
 
@@ -1221,7 +1231,7 @@ def mostrar_dashboard_comparativo(previo, posterior, ili=None):
     if ili is not None and ili > 0:
         cu = estimar_carl_uarl(previo["nmf"], ili)
         if cu is not None:
-            pct = (volumen_ahorrado_anual / cu["margen_teorico"] * 100) if cu["margen_teorico"] > 0 else None
+            pct = (volumen_ahorrado_anual / cu["margen_teorico"] * 100) if (volumen_ahorrado_anual is not None and cu["margen_teorico"] > 0) else None
             texto_ili = (
                 f"**Índice de Fugas (ILI = {cu['ili']:.2f})** — CARL aproximado {cu['carl_aprox']:,.0f} m³/año, "
                 f"UARL {cu['uarl']:,.0f} m³/año, margen teórico de reducción {cu['margen_teorico']:,.0f} m³/año"
